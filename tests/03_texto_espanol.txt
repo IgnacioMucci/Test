@@ -1,0 +1,10 @@
+texto
+Un nodo de FlareSense despierta cada cierto tiempo, lee sus sensores y arma una trama con los valores medidos.
+Como el enlace satelital es caro y lento, cada byte que se ahorra en la trama se traduce en energia y en dinero.
+Por eso se comparan dos ideas: usar un formato compacto propio, o dejar el JSON y comprimirlo con un algoritmo general.
+Los algoritmos de diccionario como LZ78 aprenden las repeticiones del propio mensaje mientras lo leen.
+Cuando el mensaje es muy corto casi no hay repeticiones que aprender, y el compresor puede agrandar el dato.
+A medida que el mensaje crece aparecen patrones repetidos y la compresion empieza a dar resultados positivos.
+El texto en lenguaje natural suele comprimirse menos que los datos de sensores, porque las palabras varian mucho.
+En cambio una serie de temperaturas que cambia despacio repite muchos digitos y se comprime mejor.
+Medir es la unica forma de saber cual conviene, y guardar los archivos comprimidos sirve como evidencia de la medicion.

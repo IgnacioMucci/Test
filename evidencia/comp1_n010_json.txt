@@ -1,0 +1,1 @@
+{"nodeId": "fcb467dadbdc", "fw": "v3.4.681-development-89d6deb", "timeDeltaM": 1800, "com_mode": 0, "rssi": 215, "readings": {"temperature": [5.5, 4.9, 5.5, 7, 6.8, 6.1, 8.1, 7, 8.3, 8.8]}}

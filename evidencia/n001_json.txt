@@ -1,0 +1,1 @@
+{"nodeId": "fcb467dadbdc", "fw": "v3.4.681-development-89d6deb", "timeDeltaM": 1800, "com_mode": 0, "rssi": 215, "readings": {"temperature": [5.5], "temperature_aux": [5.1], "humidity": [94.5], "humidity_aux": [87.4], "pressure": [1011], "wind_deg": [0], "wind_gust": [0], "wind_speed": [0], "battery": [4074]}}

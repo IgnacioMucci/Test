@@ -1,0 +1,1 @@
+{"nodeId": "fcb467dadbdc", "fw": "v3.4.681-development-89d6deb", "timeDeltaM": 1800, "com_mode": 0, "rssi": 215, "readings": {"battery": [4074]}}
