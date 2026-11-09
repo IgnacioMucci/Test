@@ -414,14 +414,73 @@ static int armar_trama(const char *csv, long n, long off, int modo, Trama *t)
     }
     return 0;
 }
+static int contar_lecturas(const char *s, int *items, int *numeros)
+{
+    const char *p = strstr(s, "\"readings\"");
+    int depth = 0, en_str = 0;
+    *items = *numeros = 0;
+    if (!p || !(p = strchr(p, '['))) return 0;
+    for (; *p; p++) {
+        char c = *p;
+        if (en_str) {
+            if (c == '\\' && p[1]) p++;
+            else if (c == '"') en_str = 0;
+            continue;
+        }
+        if (c == '"') { en_str = 1; continue; }
+        if (c == '[' || c == '{') { depth++; continue; }
+        if (c == ']' || c == '}') {
+            depth--;
+            if (depth == 1) (*items)++;
+            if (depth == 0) break;
+            continue;
+        }
+        if (c == '-' || (c >= '0' && c <= '9')) {
+            const char *q = p;
+            while (*q && strchr("0123456789.-+eE", *q)) q++;
+            if (!*q) break;                    /* numero cortado por el prefijo */
+            (*numeros)++;
+            if (depth == 1) (*items)++;
+            p = q - 1;
+        }
+    }
+    return 1;
+}
+ 
+/* Muestra el contenido de los primeros l bytes de d (texto escapado + hex). */
+static void mostrar_prefijo(const char *nom, const uint8_t *d, size_t l, size_t una_muestra, int es_json)
+{
+    char *tmp = malloc(l + 1);
+    if (!tmp) return;
+    memcpy(tmp, d, l); tmp[l] = 0;
+    printf("\n  %s (%zu B; una muestra completa mide %zu B)\n    texto: \"", nom, l, una_muestra);
+    for (size_t i = 0; i < l; i++) {
+        uint8_t c = d[i];
+        if (c == '\n') fputs("\\n", stdout);
+        else if (c >= 32 && c < 127) putchar(c);
+        else printf("\\x%02x", c);
+    }
+    printf("\"\n    hex:   ");
+    for (size_t i = 0; i < l; i++) printf("%02x%s", d[i], (i % 4 == 3) ? " " : "");
+    printf("\n");
+    if (es_json) {
+        int it, nu;
+        if (contar_lecturas(tmp, &it, &nu))
+            printf("    lecturas completas dentro del prefijo: %d | numeros completos en readings: %d\n", it, nu);
+        else
+            printf("    (el prefijo todavia no llega a \"readings\": son solo metadatos del encabezado)\n");
+    }
+    free(tmp);
+}
 
 /* ---- evaluacion: las 4 combinaciones + las dos tramas sin comprimir ---- */
 
-typedef struct { size_t nj, nb; Res rj, rb; int mal; } Ev;
+typedef struct { size_t nj, nb; Res rj, rb; int mal; int items, nums; } Ev;
 
 static int evaluar(const Trama *t, Ev *e)
 {
     e->nj = t->nj; e->nb = t->nb;
+    contar_lecturas(t->json, &e->items, &e->nums);  
     e->mal  = probar((const uint8_t *)t->json, t->nj, &e->rj);
     e->mal |= probar((const uint8_t *)t->bare, t->nb, &e->rb);
     return e->mal;
@@ -509,12 +568,13 @@ static int es_hito(int n, int maxn)
 static void trama_minima(const Ev *ev, int maxn)
 {
     static const char *nom[4] = { "JSON + LZ78", "JSON + TAMP", "FORMATO + LZ78", "FORMATO + TAMP" };
-
+ 
     printf("\n-- TRAMA MINIMA: primera cantidad de muestras donde la salida es MENOR que la entrada --\n");
-    printf("   (probado con 1..%d muestras; 'ahorro' es contra la propia entrada; 'vs JSON' contra el JSON de ese tamaño)\n", maxn);
-    printf("\n%-16s %8s %9s %9s %9s %12s %15s\n",
-           "combinacion", "muestras", "entrada", "salida", "ahorro", "vs JSON", "estable desde");
-    printf("-------------------------------------------------------------------------------------\n");
+    printf("   (probado con 1..%d muestras; 'lect.' = elementos de readings; 'nums' = valores numericos dentro de readings;\n", maxn);
+    printf("    'ahorro' es contra la propia entrada; 'vs JSON' contra el JSON de ese tamaño)\n");
+    printf("\n%-16s %8s %5s %5s %9s %9s %9s %10s %14s\n",
+           "combinacion", "muestras", "lect.", "nums", "entrada", "salida", "ahorro", "vs JSON", "estable desde");
+    printf("--------------------------------------------------------------------------------------------------\n");
     for (int c = 0; c < 4; c++) {
         int primero = 0, estable = 0;
         for (int n = 1; n <= maxn; n++) if (sale_menos(&ev[n], c)) { primero = n; break; }
@@ -525,26 +585,28 @@ static void trama_minima(const Ev *ev, int maxn)
         }
         size_t in; long z;
         datos_comb(&ev[primero], c, &in, &z);
-        printf("%-16s %8d %9zu B %9ld B %+8.1f%% %+8.1f%% ", nom[c], primero, in, z,
+        printf("%-16s %8d %5d %5d %7zu B %7ld B %+8.1f%% %+9.1f%% ", nom[c], primero,
+               ev[primero].items, ev[primero].nums, in, z,
                (1.0 - (double)z / (double)in) * 100.0,
                (1.0 - (double)z / (double)ev[primero].nj) * 100.0);
-        if (estable) printf("%9d\n", estable);
-        else         printf("%9s\n", "no");
+        if (estable) printf("%8d\n", estable);
+        else         printf("%8s\n", "no");
     }
 }
-
 /* ---- TAMAÑO MINIMO EN BYTES / BITS ---- */
 
 /* Prueba prefijos de 1..len bytes de la trama y busca, para cada combinacion:
  *  (a) el primer tamaño de entrada donde la salida es MENOR que la entrada
  *  (b) desde que tamaño ya no vuelve a agrandar nunca mas (hasta el tope) */
-static void minimo_bytes(const Trama *t)
+
+static void minimo_bytes(const Trama *t, const Ev *ev1)
 {
     static const char *nom[4] = { "JSON + LZ78", "JSON + TAMP", "FORMATO + LZ78", "FORMATO + TAMP" };
-    enum { TOPE = 4096 };                          /* maximo de bytes a barrer */
-
+    enum { TOPE = 4096 };
+    size_t pri[4] = { 0 };
+ 
     printf("\n-- TAMAÑO MINIMO PARA COMPRIMIR (prefijos de la trama mas larga, byte a byte) --\n");
-    printf("   (bits = bytes x 8: los compresores trabajan con bytes enteros)\n");
+    printf("   (se toman los primeros l bytes de la trama larga, l = 1,2,3...; el corte puede caer en medio de un valor)\n");
     printf("\n%-16s %-22s %9s %9s  %-22s\n",
            "combinacion", "empieza a comprimir", "salida", "ahorro", "comprime siempre desde");
     printf("--------------------------------------------------------------------------------------------\n");
@@ -554,7 +616,7 @@ static void minimo_bytes(const Trama *t)
         long zp = 0;
         uint8_t *z;
         char a[48], b[48];
-
+ 
         if (len > TOPE) len = TOPE;
         cap = len * 3 + 64;
         z = malloc(cap);
@@ -571,11 +633,20 @@ static void minimo_bytes(const Trama *t)
             printf("%-16s no comprime con ningun prefijo de 1..%zu bytes\n", nom[c], len);
             continue;
         }
+        pri[c] = primero;
         snprintf(a, sizeof a, "%zu B (%zu bits)", primero, primero * 8);
         if (ultimo_mal < len) snprintf(b, sizeof b, "%zu B (%zu bits)", ultimo_mal + 1, (ultimo_mal + 1) * 8);
         else                  snprintf(b, sizeof b, "no (hasta %zu B)", len);
         printf("%-16s %-22s %7ld B %+8.1f%%  %-22s\n", nom[c], a, zp,
                (1.0 - (double)zp / (double)primero) * 100.0, b);
+    }
+ 
+    /* NUEVO: que hay adentro de esos bytes */
+    printf("\n-- CONTENIDO DE ESOS BYTES (primeros bytes de la trama larga, sin comprimir) --");
+    for (int c = 0; c < 4; c++) {
+        if (!pri[c]) continue;
+        mostrar_prefijo(nom[c], (const uint8_t *)(c < 2 ? t->json : t->bare), pri[c],
+                        c < 2 ? ev1->nj : ev1->nb, c < 2);
     }
 }
 
@@ -732,14 +803,14 @@ static int modo_flare(const char *csv, int maxn, int comp_n, long off, int jmodo
     for (int k = 1; k <= maxn; k++) {
         char et[32];
         if (!es_hito(k, maxn)) continue;
-        snprintf(et, sizeof et, "%d muestra%s", k, k == 1 ? "" : "s");
+        snprintf(et, sizeof et, "%d muestra%s (%d lect.)", k, k == 1 ? "" : "s", ev[k].items);
         fila_flare(et, &ev[k]);
     }
 
     trama_minima(ev, maxn);
 
      Trama larga;
-    if (!armar_trama(csv, maxn, off, jmodo, &larga)) { minimo_bytes(&larga); liberar(&larga); }
+    if (!armar_trama(csv, maxn, off, jmodo, &larga)) { minimo_bytes(&larga, &ev[1]); liberar(&larga); }
 
     /* composicion de la trama */
     printf("\n-- COMPOSICION DE LA TRAMA (que sensores lleva), con 1 y %d muestras --", comp_n);
@@ -750,6 +821,8 @@ static int modo_flare(const char *csv, int maxn, int comp_n, long off, int jmodo
         perror("mkstemp");
     } else {
         close(fd);
+      struct { const char *nom; int nvalores; double fj, pj, fb, pb; } costo[16];
+       int ncosto = 0;
         for (size_t c = 0; c < sizeof COMP / sizeof COMP[0]; c++) {
             int r = csv_subconjunto(d, n, tmp, COMP[c].cols);
             if (r < 0) { fprintf(stderr, "error armando CSV temporal\n"); fallas++; break; }
@@ -759,15 +832,43 @@ static int modo_flare(const char *csv, int maxn, int comp_n, long off, int jmodo
             }
             int ks[2] = { 1, comp_n }, nk = comp_n > 1 ? 2 : 1;
             for (int j = 0; j < nk; j++) {
+               #if 0
+            int ks[2] = { 1, comp_n }, nk = comp_n > 1 ? 2 : 1;
+            Ev e1 = { 0 }, ek = { 0 };
+            for (int j = 0; j < nk; j++) {
                 Trama t; Ev e; char et[64];
                 if (armar_trama(tmp, ks[j], off, jmodo, &t)) { fallas++; continue; }
                 fallas += evaluar(&t, &e);
                 snprintf(et, sizeof et, "%s [n=%d]", COMP[c].nombre, ks[j]);
                 fila_flare(et, &e);
                 { char pre[48]; snprintf(pre, sizeof pre, "comp%zu_n%03d", c, ks[j]); guardar_evidencia(pre, &t); }
+                if (j == 0) e1 = e; else ek = e;
                 liberar(&t);
             }
+            if (nk == 2 && ncosto < 16) {         /* promedio por muestra = (tam(n) - tam(1)) / (n-1) */
+                int nv = 0; while (COMP[c].cols[nv]) nv++;
+                double dn = (double)(comp_n - 1);
+                costo[ncosto].nom = COMP[c].nombre;
+                costo[ncosto].nvalores = nv;
+                costo[ncosto].pj = ((double)ek.nj - (double)e1.nj) / dn;
+                costo[ncosto].fj = (double)e1.nj - costo[ncosto].pj;
+                costo[ncosto].pb = ((double)ek.nb - (double)e1.nb) / dn;
+                costo[ncosto].fb = (double)e1.nb - costo[ncosto].pb;
+                ncosto++;
+            }
+        #endif
+            }
         }
+      #if 0
+        printf("\n-- COSTO EN BYTES POR COMPOSICION (sin comprimir): fijo + por muestra --\n");
+        printf("   (por muestra = promedio de (n=%d) - (n=1) sobre %d; fijo = lo que queda: encabezado/nodeId/etc.)\n",
+               comp_n, comp_n - 1);
+        printf("\n%-28s %8s | %-24s | %-24s\n", "composicion", "valores", "JSON (fijo + x muestra)", "FORMATO (fijo + x muestra)");
+        printf("--------------------------------------------------------------------------------------\n");
+        for (int i = 0; i < ncosto; i++)
+            printf("%-28s %8d | %6.1f B + %6.1f B/muestra | %6.1f B + %6.1f B/muestra\n",
+                   costo[i].nom, costo[i].nvalores, costo[i].fj, costo[i].pj, costo[i].fb, costo[i].pb);
+#endif
         unlink(tmp);
     }
     if (out_dir[0]) printf("\nEvidencia guardada en '%s' (verificar tamaños con: ls -l %s)\n", out_dir, out_dir);
