@@ -447,40 +447,143 @@ static int contar_lecturas(const char *s, int *items, int *numeros)
     return 1;
 }
  
-/* Muestra el contenido de los primeros l bytes de d (texto escapado + hex). */
+
+static const struct { int id; const char *nombre; const char *campos[8]; const char *aux[3]; } ESQ[] = {
+    {   1, "ds18b20",         { "temperature", NULL },                                                     { "temperature_aux", NULL } },
+    {   2, "sht3x",           { "temperature", "humidity", NULL },                                         { "temperature_aux", "humidity_aux", NULL } },
+    {   3, "weather_station", { "wind_speed", "wind_gust", "wind_deg", "temperature", "humidity", "pressure", NULL }, { NULL } },
+    {   4, "rain_gauge",      { "rain", NULL },                                                            { NULL } },
+    {   7, "bh1750",          { "lux", NULL },                                                             { NULL } },
+    {   9, "battery",         { "battery", NULL },                                                         { NULL } },
+    { 130, "ds18b20_aux",     { "temperature", NULL },                                                     { NULL } },   /* 0x82 */
+};
+
+/* ---- evaluacion: las 4 combinaciones + las dos tramas sin comprimir ---- */
+
+static void contar_valores(const char *s, int *series, int *valores)
+{
+    const char *p = strstr(s, "\"readings\"");
+    int en_arr = 0, en_tok = 0;
+    *series = *valores = 0;
+    if (!p) return;
+    for (p += 10; *p; p++) {
+        char c = *p;
+        if (c == '[')                { (*series)++; en_arr = 1; en_tok = 0; }
+        else if (c == ']')           { en_arr = 0; en_tok = 0; }
+        else if (c == ',' || c == ' ') en_tok = 0;
+        else if (en_arr && !en_tok)  { en_tok = 1; (*valores)++; }
+    }
+}
+ 
+/* Imprime los valores de una serie desde p hasta uno de los caracteres de 'fines' (o fin del
+ * texto). Devuelve el puntero donde paro. Un valor sin terminador al final queda marcado (cortado). */
+static const char *leer_serie(const char *p, const char *fines)
+{
+    char tok[40];
+    size_t k = 0;
+    int primero = 1;
+    for (;; p++) {
+        char c = *p;
+        int fin = (c == 0) || strchr(fines, c) != NULL;
+        if (c == ',' || fin) {
+            tok[k] = 0;
+            if (k) {
+                printf("%s%s%s", primero ? "" : ", ", tok, c == 0 ? " (cortado)" : "");
+                primero = 0;
+            }
+            k = 0;
+            if (fin) return p;
+        } else if (c != ' ' && k < sizeof tok - 1) {
+            tok[k++] = c;
+        }
+    }
+}
+ 
+/* Desglosa un prefijo (o trama) en FORMATO: encabezado, sensores, campos y valores. */
+static void anotar_formato(const char *s)
+{
+    size_t n = strlen(s), i;
+    int hay_ws = strstr(s, "(3)[") != NULL;   /* si esta weather_station, sht3x/ds18b20 usan nombres _aux */
+ 
+    printf("    nodeId  (3 chars): %.*s\n", (int)(n < 3 ? n : 3), s);
+    if (n > 4) printf("    delta_t (5 digitos): %.*s\n", (int)(n - 4 < 5 ? n - 4 : 5), s + 4);
+    if (n <= 10) { printf("    (el prefijo termina dentro del encabezado)\n"); return; }
+    for (i = 10; i < n && s[i] == '('; ) {
+        int sid = atoi(s + i + 1), f = 0, e = -1;
+        const char *par = strchr(s + i, ')'), *nombre = "?";
+        const char *const *campos = NULL;
+        if (!par || par[1] != '[') { printf("    (sensor cortado: \"%s\")\n", s + i); return; }
+        for (size_t k = 0; k < sizeof ESQ / sizeof ESQ[0]; k++)
+            if (ESQ[k].id == sid) { e = (int)k; break; }
+        if (e >= 0) {
+            nombre = ESQ[e].nombre;
+            campos = (hay_ws && ESQ[e].aux[0]) ? ESQ[e].aux : ESQ[e].campos;
+        }
+        printf("    sensor (%d) %s\n", sid, nombre);
+        const char *p = par + 2;
+        for (;;) {
+            if (campos && campos[f]) printf("      %-16s = ", campos[f]);
+            else                     printf("      campo %-10d = ", f);
+            p = leer_serie(p, ";]");
+            printf("\n");
+            if (*p == ';') { p++; f++; continue; }
+            break;
+        }
+        if (*p == ']') { p++; i = (size_t)(p - s); }
+        else return;                                       /* prefijo termino adentro de este sensor */
+    }
+}
+ 
+/* Desglosa un prefijo (o trama) JSON: metadatos y, por cada serie, los valores. */
+static void anotar_json(const char *s)
+{
+    const char *r = strstr(s, "\"readings\"");
+    if (!r) {
+        printf("    todo metadatos (%zu B): nodeId, fw, timeDeltaM, com_mode, rssi; todavia no hay ningun valor de sensor\n", strlen(s));
+        return;
+    }
+    printf("    metadatos: %zu B antes de \"readings\" (nodeId, fw, timeDeltaM, com_mode, rssi)\n", (size_t)(r - s));
+    const char *p = strchr(r, '{');
+    if (!p) return;
+    for (p++; *p; ) {
+        const char *k0 = strchr(p, '"'), *k1;
+        if (!k0) return;
+        k1 = strchr(k0 + 1, '"');
+        if (!k1) { printf("      (nombre de serie cortado)\n"); return; }
+        printf("      %-16.*s = ", (int)(k1 - k0 - 1), k0 + 1);
+        p = strchr(k1, '[');
+        if (!p) { printf("(todavia sin valores)\n"); return; }
+        p = leer_serie(p + 1, "]");
+        printf("\n");
+        if (*p != ']') return;
+        p++;
+    }
+}
+ 
+/* Muestra el contenido de los primeros l bytes de d: texto, hex y desglose por campo. */
 static void mostrar_prefijo(const char *nom, const uint8_t *d, size_t l, size_t una_muestra, int es_json)
 {
     char *tmp = malloc(l + 1);
     if (!tmp) return;
     memcpy(tmp, d, l); tmp[l] = 0;
-    printf("\n  %s (%zu B; una muestra completa mide %zu B)\n    texto: \"", nom, l, una_muestra);
+    printf("\n  %s: %zu B (una muestra completa mide %zu B)\n    texto: \"", nom, l, una_muestra);
     for (size_t i = 0; i < l; i++) {
         uint8_t c = d[i];
         if (c == '\n') fputs("\\n", stdout);
         else if (c >= 32 && c < 127) putchar(c);
         else printf("\\x%02x", c);
     }
-    printf("\"\n    hex:   ");
-    for (size_t i = 0; i < l; i++) printf("%02x%s", d[i], (i % 4 == 3) ? " " : "");
-    printf("\n");
-    if (es_json) {
-        int it, nu;
-        if (contar_lecturas(tmp, &it, &nu))
-            printf("    lecturas completas dentro del prefijo: %d | numeros completos en readings: %d\n", it, nu);
-        else
-            printf("    (el prefijo todavia no llega a \"readings\": son solo metadatos del encabezado)\n");
-    }
+    printf("\"\n");
+    if (es_json) anotar_json(tmp); else anotar_formato(tmp);
     free(tmp);
 }
 
-/* ---- evaluacion: las 4 combinaciones + las dos tramas sin comprimir ---- */
-
-typedef struct { size_t nj, nb; Res rj, rb; int mal; int items, nums; } Ev;
-
+typedef struct { size_t nj, nb; Res rj, rb; int mal; int series, valores; } Ev;
+ 
 static int evaluar(const Trama *t, Ev *e)
 {
     e->nj = t->nj; e->nb = t->nb;
-    contar_lecturas(t->json, &e->items, &e->nums);  
+    contar_valores(t->json, &e->series, &e->valores);    /* NUEVO */
     e->mal  = probar((const uint8_t *)t->json, t->nj, &e->rj);
     e->mal |= probar((const uint8_t *)t->bare, t->nb, &e->rb);
     return e->mal;
@@ -570,11 +673,11 @@ static void trama_minima(const Ev *ev, int maxn)
     static const char *nom[4] = { "JSON + LZ78", "JSON + TAMP", "FORMATO + LZ78", "FORMATO + TAMP" };
  
     printf("\n-- TRAMA MINIMA: primera cantidad de muestras donde la salida es MENOR que la entrada --\n");
-    printf("   (probado con 1..%d muestras; 'lect.' = elementos de readings; 'nums' = valores numericos dentro de readings;\n", maxn);
-    printf("    'ahorro' es contra la propia entrada; 'vs JSON' contra el JSON de ese tamaño)\n");
-    printf("\n%-16s %8s %5s %5s %9s %9s %9s %10s %14s\n",
-           "combinacion", "muestras", "lect.", "nums", "entrada", "salida", "ahorro", "vs JSON", "estable desde");
-    printf("--------------------------------------------------------------------------------------------------\n");
+    printf("   (probado con 1..%d muestras; 1 muestra = 1 fila del CSV = 1 valor por cada serie;\n", maxn);
+    printf("    valores = muestras x series; 'ahorro' contra la propia entrada; 'vs JSON' contra el JSON de ese tamaño)\n");
+    printf("\n%-16s %8s %7s %8s %9s %9s %9s %10s %14s\n",
+           "combinacion", "muestras", "series", "valores", "entrada", "salida", "ahorro", "vs JSON", "estable desde");
+    printf("-----------------------------------------------------------------------------------------------------\n");
     for (int c = 0; c < 4; c++) {
         int primero = 0, estable = 0;
         for (int n = 1; n <= maxn; n++) if (sale_menos(&ev[n], c)) { primero = n; break; }
@@ -585,8 +688,8 @@ static void trama_minima(const Ev *ev, int maxn)
         }
         size_t in; long z;
         datos_comb(&ev[primero], c, &in, &z);
-        printf("%-16s %8d %5d %5d %7zu B %7ld B %+8.1f%% %+9.1f%% ", nom[c], primero,
-               ev[primero].items, ev[primero].nums, in, z,
+        printf("%-16s %8d %7d %8d %7zu B %7ld B %+8.1f%% %+9.1f%% ", nom[c], primero,
+               ev[primero].series, ev[primero].valores, in, z,
                (1.0 - (double)z / (double)in) * 100.0,
                (1.0 - (double)z / (double)ev[primero].nj) * 100.0);
         if (estable) printf("%8d\n", estable);
@@ -606,7 +709,8 @@ static void minimo_bytes(const Trama *t, const Ev *ev1)
     size_t pri[4] = { 0 };
  
     printf("\n-- TAMAÑO MINIMO PARA COMPRIMIR (prefijos de la trama mas larga, byte a byte) --\n");
-    printf("   (se toman los primeros l bytes de la trama larga, l = 1,2,3...; el corte puede caer en medio de un valor)\n");
+    printf("   (se toman los primeros l bytes de la trama larga, l = 1,2,3...; NO es una trama valida:\n");
+    printf("    el corte puede caer en medio de un valor, y en el FORMATO los primeros bytes son los de UN solo campo)\n");
     printf("\n%-16s %-22s %9s %9s  %-22s\n",
            "combinacion", "empieza a comprimir", "salida", "ahorro", "comprime siempre desde");
     printf("--------------------------------------------------------------------------------------------\n");
@@ -641,8 +745,7 @@ static void minimo_bytes(const Trama *t, const Ev *ev1)
                (1.0 - (double)zp / (double)primero) * 100.0, b);
     }
  
-    /* NUEVO: que hay adentro de esos bytes */
-    printf("\n-- CONTENIDO DE ESOS BYTES (primeros bytes de la trama larga, sin comprimir) --");
+    printf("\n-- CONTENIDO EXACTO DE ESOS BYTES (primeros bytes de la trama larga, sin comprimir) --");
     for (int c = 0; c < 4; c++) {
         if (!pri[c]) continue;
         mostrar_prefijo(nom[c], (const uint8_t *)(c < 2 ? t->json : t->bare), pri[c],
@@ -795,7 +898,15 @@ static int modo_flare(const char *csv, int maxn, int comp_n, long off, int jmodo
     }
 
     if (ej.json && ej.bare)
-        printf("\nEjemplo (1 muestra):\n  JSON    (%zu B): %s\n  FORMATO (%zu B): %s\n", ej.nj, ej.json, ej.nb, ej.bare);
+            printf("\nEjemplo (1 muestra):\n  JSON    (%zu B): %s\n  FORMATO (%zu B): %s\n", ej.nj, ej.json, ej.nb, ej.bare);
+    #if 0
+      if (ej.json && ej.bare) {
+          printf("\nQue contiene 1 muestra (1 fila del CSV):\n  FORMATO:\n");
+          anotar_formato(ej.bare);
+          printf("  JSON:\n");
+          anotar_json(ej.json);
+      }
+    #endif
     liberar(&ej);
 
     printf("\n-- Barrido por cantidad de muestras --");
@@ -803,14 +914,14 @@ static int modo_flare(const char *csv, int maxn, int comp_n, long off, int jmodo
     for (int k = 1; k <= maxn; k++) {
         char et[32];
         if (!es_hito(k, maxn)) continue;
-        snprintf(et, sizeof et, "%d muestra%s (%d lect.)", k, k == 1 ? "" : "s", ev[k].items);
+       snprintf(et, sizeof et, "%d muestra%s (%d valores)", k, k == 1 ? "" : "s", ev[k].valores);
         fila_flare(et, &ev[k]);
     }
 
     trama_minima(ev, maxn);
 
      Trama larga;
-    if (!armar_trama(csv, maxn, off, jmodo, &larga)) { minimo_bytes(&larga, &ev[1]); liberar(&larga); }
+   if (!armar_trama(csv, maxn, off, jmodo, &larga)) { minimo_bytes(&larga, &ev[1]); liberar(&larga); }
 
     /* composicion de la trama */
     printf("\n-- COMPOSICION DE LA TRAMA (que sensores lleva), con 1 y %d muestras --", comp_n);
